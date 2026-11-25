@@ -233,6 +233,105 @@ def test_share_token_roundtrip_and_unapproved_import(isolated_env):
         decode_share_token("hf1.!!!corrupted!!!")
 
 
+# ------------------------------------------------------- Sharing: recipient safety
+
+def test_import_never_overwrites_an_existing_app(isolated_env):
+    """A shared bundle must not be able to destroy the recipient's own app.
+
+    Bundle ids travel between machines, so two people's "dashboard" collide. Landing
+    on the same id would hit save_app's UPDATE branch and replace the recipient's code,
+    name and approvals with someone else's.
+    """
+    st = HermifactsStore(root=isolated_env.data_root)
+    mine = st.save_app(app_id="dashboard", name="My Dashboard", html="<h1>mine</h1>")
+    bundle = dict(st.export_bundle("dashboard"), html="<h1>theirs</h1>", name="Their Dashboard")
+
+    imported = st.import_bundle(dict(bundle))  # no explicit app_id: must not reuse "dashboard"
+    assert imported["id"] == "dashboard-2"
+    assert imported["import_renamed_from"] == "dashboard"
+
+    survivor = st.get_app("dashboard", include_html=True)
+    assert survivor["html"] == "<h1>mine</h1>"
+    assert survivor["name"] == "My Dashboard"
+    assert survivor["code_hash"] == mine["code_hash"]
+
+    # Importing the same bundle again keeps counting instead of colliding.
+    assert st.import_bundle(dict(bundle))["id"] == "dashboard-3"
+
+
+def test_import_reports_hash_mismatch_and_pins_to_real_bytes(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    st.save_app(app_id="src", name="Src", html="<p>real</p>", inputs=[])
+    bundle = dict(st.export_bundle("src"), code_hash="deadbeef" * 8)  # sender lied / corrupt
+
+    imported = st.import_bundle(bundle)
+    assert imported["hash_matches_bundle"] is False
+    assert imported["hash_declared"] == "deadbeef" * 8
+    assert imported["code_hash"] == compute_code_hash("<p>real</p>", [])
+    assert imported["effective_tier"] == "sandbox"
+
+    honest = st.import_bundle(dict(st.export_bundle("src")))  # untouched bundle matches
+    assert honest["hash_matches_bundle"] is True
+
+
+def test_imported_bundle_with_elevated_request_lands_in_sandbox(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    bundle = {
+        "schema": "hermifact.bundle.v1",
+        "id": "greedy",
+        "name": "Greedy",
+        "html": "<p>hi</p>",
+        "permissions": {"requested_tier": "full", "requested_caps": ["llm", "fs"], "requested_tools": ["terminal"]},
+    }
+    app = st.import_bundle(bundle)
+    assert app["requested_tier"] == "full"      # the ask is recorded, so it can be reviewed
+    assert app["requested_tools"] == ["terminal"]
+    assert app["effective_tier"] == "sandbox"   # but nothing is granted
+    assert app["effective_caps"] == []
+    assert app["needs_approval"] is True
+    assert app["approved_hash"] == ""
+    assert app["imported"] is True
+
+
+def test_preview_bundle_describes_without_writing(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    st.save_app(app_id="taken", name="Taken", html="<p>a</p>")
+    bundle = {"id": "taken", "name": "Preview Me", "html": "<p>b</p>",
+              "permissions": {"requested_tier": "app", "requested_caps": ["llm"]}}
+    before = st.list_apps()
+    preview = st.preview_bundle(bundle)
+    assert st.list_apps() == before                 # nothing was installed
+    assert preview["id_would_be"] == "taken-2"
+    assert preview["renamed_from"] == "taken"
+    assert preview["would_overwrite"] is False
+    assert preview["requested_tier"] == "app"
+    assert preview["starts_in_sandbox"] is True
+    assert preview["code_hash"] == compute_code_hash("<p>b</p>", [])
+    assert preview["html_bytes"] == len("<p>b</p>".encode())
+
+
+def test_share_decode_bounds_untrusted_input(isolated_env):
+    with pytest.raises(ValueError, match="character limit"):
+        decode_share_token("hf1." + "A" * (store.MAX_SHARE_INPUT_CHARS + 1))
+    # A malformed body inside the size budget still fails as a clean ValueError.
+    with pytest.raises(ValueError, match="Invalid or corrupted"):
+        decode_share_token("hf1." + "AAAA")
+
+
+def test_export_flags_tokens_too_long_for_a_message(isolated_env):
+    """Incompressible payloads produce tokens no chat client can carry; say so."""
+    import base64
+    import os
+
+    st = HermifactsStore(root=isolated_env.data_root)
+    st.save_app(app_id="big", name="Big", html="<pre>" + base64.b64encode(os.urandom(6000)).decode() + "</pre>")
+    out = json.loads(tools.handle_export({"app_id": "big"}))
+    assert out["ok"] is True
+    assert out["token_chars"] > store.MAX_SHARE_MESSAGE_CHARS
+    assert out["fits_in_chat_message"] is False
+    assert ".hermifact.json" in out["share_hint"]
+
+
 # ------------------------------------------------------------------ PWA & Launcher
 
 def test_pwa_shell_sandbox_and_assets(isolated_env):
@@ -322,9 +421,14 @@ def test_plugin_register_and_tool_handlers(isolated_env):
     exported = json.loads(tools.handle_export({"app_id": "agent-made"}))
     assert exported["ok"] is True
     assert exported["share_token"].startswith("hf1.")
-    assert "?import=hf1." in exported["share_url"]
+    # No public_origin is configured in this environment, so there is no URL a
+    # recipient could open — offering a 127.0.0.1 one would point them at themselves.
+    assert exported["share_url"] == ""
+    assert exported["link_reachable_by_recipient"] is False
+    assert exported["share_path"].startswith("/hermifacts?import=hf1.")
+    assert exported["fits_in_chat_message"] is True
 
-    imported = json.loads(tools.handle_import({"share_link": exported["share_url"], "app_id": "agent-clone"}))
+    imported = json.loads(tools.handle_import({"share_link": exported["share_path"], "app_id": "agent-clone"}))
     assert imported["ok"] is True
     assert imported["app"]["id"] == "agent-clone"
     assert imported["app"]["effective_tier"] == "sandbox"
@@ -479,3 +583,61 @@ def test_fastapi_crud_bridge_and_pwa_routes(isolated_env, monkeypatch: pytest.Mo
     tpl_app = tpl.json()["app"]
     assert "window.hermesApp.llm.complete" in tpl_app["html"]
     assert len(tpl_app["inputs"]) >= 2
+
+
+# --------------------------------------------------- Sharing: HTTP flow end to end
+
+def test_share_flow_over_http_export_inspect_import(isolated_env, monkeypatch: pytest.MonkeyPatch):
+    """The recipient's whole journey: link in hand, preview, import, nothing clobbered."""
+    api_mod = _load_api_module()
+    priv_rt = api_mod._mod("runtime")
+    monkeypatch.setattr(priv_rt, "data_dir", lambda: isolated_env.data_root)
+    monkeypatch.setattr(priv_rt, "dispatch_tool", lambda name, args: {})
+
+    app = FastAPI()
+    app.include_router(api_mod.router, prefix="/api/plugins/hermifacts")
+    client = TestClient(app)
+    P = "/api/plugins/hermifacts"
+
+    made = client.post(f"{P}/apps", json={
+        "app_id": "shared",
+        "name": "Shared",
+        "html": "<h1>from sender</h1>",
+        "requested_tier": "app",
+        "requested_caps": ["llm"],
+    })
+    assert made.status_code == 200
+
+    exp = client.get(f"{P}/apps/shared/export").json()
+    assert exp["ok"] is True
+    token = exp["share_token"]
+    assert exp["token_chars"] == len(token)
+    assert exp["fits_in_chat_message"] is True
+    assert exp["link_reachable_by_recipient"] is False  # no public_origin configured here
+
+    # Preview from the raw token: describes the install, writes nothing.
+    before = client.get(f"{P}/apps").json()["apps"]
+    ins = client.post(f"{P}/apps/inspect", json={"share_link": token}).json()
+    assert ins["ok"] is True
+    assert ins["id_would_be"] == "shared-2"   # "shared" already lives in this store
+    assert ins["renamed_from"] == "shared"
+    assert ins["starts_in_sandbox"] is True
+    assert ins["hash_matches_bundle"] is True
+    assert client.get(f"{P}/apps").json()["apps"] == before
+
+    # Import through the share path (the ?import= form the UI receives).
+    imp = client.post(f"{P}/apps/import", json={"share_link": exp["share_path"]}).json()
+    assert imp["ok"] is True
+    assert imp["app"]["id"] == "shared-2"
+    assert imp["app"]["effective_tier"] == "sandbox"
+    assert imp["app"]["needs_approval"] is True
+    assert imp["app"]["import_renamed_from"] == "shared"
+
+    # The sender's app in this store is untouched: same html, same version.
+    orig = client.get(f"{P}/apps/shared").json()["app"]
+    assert orig["html"] == "<h1>from sender</h1>"
+    assert orig["version"] == 1
+
+    # A tampered token is refused as a 400, not a 500.
+    bad = client.post(f"{P}/apps/import", json={"share_link": "hf1.%%%not-base64%%%"})
+    assert bad.status_code == 400

@@ -25,6 +25,39 @@ def _default_origin() -> str:
     return "http://127.0.0.1:9120"
 
 
+def _public_origin() -> str:
+    """The origin a RECIPIENT could actually reach, or "" when there is none.
+
+    ``_default_origin`` falls back to 127.0.0.1 for local PWA links, but a loopback
+    URL is worse than no URL in a share: it silently points the recipient at their
+    own machine. Only a configured ``public_origin`` may be put in a shared link.
+    """
+    cfg = runtime.get_config("public_origin", "")
+    if isinstance(cfg, str) and cfg.strip():
+        return cfg.strip().rstrip("/")
+    return ""
+
+
+def share_link_meta(share_token: str) -> dict[str, Any]:
+    """Size facts about a token, so callers stop handing people links that truncate."""
+    from .store import MAX_SHARE_MESSAGE_CHARS
+
+    chars = len(share_token)
+    fits = chars <= MAX_SHARE_MESSAGE_CHARS
+    return {
+        "token_chars": chars,
+        "fits_in_chat_message": fits,
+        "share_hint": (
+            "Send the hf1 token or the .hermifact.json file — they work on any machine."
+            if fits
+            else (
+                f"This token is {chars:,} characters, too long for a chat message or email "
+                f"(limit ~{MAX_SHARE_MESSAGE_CHARS:,}). Send the .hermifact.json bundle instead."
+            )
+        ),
+    }
+
+
 def handle_create(args: dict[str, Any], **_: Any) -> str:
     try:
         html = args.get("html") or ""
@@ -107,14 +140,27 @@ def handle_export(args: dict[str, Any], **_: Any) -> str:
         app_id = str(args.get("app_id") or "").strip()
         bundle = get_store().export_bundle(app_id)
         share_token = encode_share_token(bundle)
-        share_url = f"{_default_origin()}/hermifacts?import={share_token}"
+        meta = share_link_meta(share_token)
+        # A link only makes sense if the recipient can open the host that serves it.
+        # Without a configured public_origin we hand over the token/path, never a
+        # loopback URL that would point the recipient at their own machine.
+        origin = _public_origin()
+        share_path = f"/hermifacts?import={share_token}"
+        share_url = f"{origin}{share_path}" if origin else ""
         out_path = str(args.get("output_path") or "").strip()
         if out_path:
             p = Path(out_path).expanduser()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
-            return _ok(path=str(p), app_id=app_id, code_hash=bundle["code_hash"], share_token=share_token, share_url=share_url)
-        return _ok(bundle=bundle, share_token=share_token, share_url=share_url)
+            return _ok(
+                path=str(p), app_id=app_id, code_hash=bundle["code_hash"],
+                share_token=share_token, share_path=share_path, share_url=share_url,
+                link_reachable_by_recipient=bool(origin), **meta,
+            )
+        return _ok(
+            bundle=bundle, share_token=share_token, share_path=share_path,
+            share_url=share_url, link_reachable_by_recipient=bool(origin), **meta,
+        )
     except Exception as exc:
         return _err(str(exc))
 

@@ -227,6 +227,12 @@ function ShareModal({ app, onClose }) {
       !data && !err && h('div', { className: 'hf-brand-sub' }, 'Packing portable Hermifact bundle...'),
       data && h('div', { className: 'hf-field' },
         h('label', null, 'Shareable Hermes Link (hf1 compressed bundle)'),
+        !data.link_reachable_by_recipient && h('div', { className: 'hf-brand-sub' },
+          'This URL only opens on a machine that can reach this host. For someone else, send the hf1 token or the .hermifact.json file — both work anywhere.'
+        ),
+        data.fits_in_chat_message === false && h('div', { className: 'hf-err' },
+          `This token is ${(data.token_chars || 0).toLocaleString()} characters, too long for a chat message or email. Download the .hermifact.json below and send that file instead.`
+        ),
         h('textarea', { className: 'hf-textarea hf-mono', rows: 3, readOnly: true, value: shareUrl }),
         h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' } },
           h('button', { type: 'button', className: 'hf-btn hf-btn-primary', onClick: () => copyText(shareUrl, 'Share link') }, 'Copy Share Link'),
@@ -243,6 +249,32 @@ function ImportModal({ initialLink, onClose, onImported }) {
   const [customId, setCustomId] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  const [preview, setPreview] = useState(null)
+  const [previewErr, setPreviewErr] = useState('')
+
+  // Decode + describe the bundle BEFORE anything is written, so the recipient approves
+  // from facts (name, tier being requested, size, exact hash) instead of a blind paste.
+  useEffect(() => {
+    const text = (raw || '').trim()
+    setPreview(null); setPreviewErr('')
+    if (!text) return undefined
+    let live = true
+    const timer = setTimeout(async () => {
+      try {
+        const body = text.startsWith('{') ? { bundle: JSON.parse(text) } : { share_link: text }
+        const out = await api('/apps/inspect', { method: 'POST', body })
+        if (live) setPreview(out)
+      } catch (e) {
+        if (!live) return
+        const msg = (e && e.message) || String(e)
+        // A gateway that has not reloaded this plugin yet has no /apps/inspect route.
+        // That is not a broken share link — stay quiet and let Import do its job.
+        if (/^(Not Found|HTTP 40[45])/.test(msg)) return
+        setPreviewErr(msg)
+      }
+    }, 400)
+    return () => { live = false; clearTimeout(timer) }
+  }, [raw])
 
   const submit = async () => {
     const text = raw.trim()
@@ -298,11 +330,34 @@ function ImportModal({ initialLink, onClose, onImported }) {
           h('input', { type: 'file', accept: '.json,application/json', onChange: onFile, style: { fontSize: '12px', paddingTop: '6px' } })
         )
       ),
+      previewErr && h('div', { className: 'hf-err' }, previewErr),
+      preview && h('div', { className: 'hf-kv' },
+        h('div', { className: 'hf-kv-row' }, h('span', null, 'App'), h('span', null, `${preview.icon || '📦'} ${preview.name}`)),
+        h('div', { className: 'hf-kv-row' }, h('span', null, 'Lands as'), h('span', { className: 'hf-mono' }, preview.id_would_be)),
+        h('div', { className: 'hf-kv-row' },
+          h('span', null, 'Starts at'),
+          h('span', null, preview.requested_tier && preview.requested_tier !== 'sandbox'
+            ? `Sandbox (Tier 1) — sender asks for ${TIER_INFO[preview.requested_tier] ? TIER_INFO[preview.requested_tier].label : preview.requested_tier}`
+            : 'Sandbox (Tier 1)')
+        ),
+        h('div', { className: 'hf-kv-row' }, h('span', null, 'Payload'), h('span', { className: 'hf-mono' }, `${(preview.html_bytes / 1024).toFixed(1)} KB`)),
+        h('div', { className: 'hf-kv-row' }, h('span', null, 'Code hash'), h('span', { className: 'hf-mono' }, `#${preview.code_hash_short}`)),
+        preview.renamed_from && h('div', { className: 'hf-kv-row' },
+          h('span', null, 'Id conflict'),
+          h('span', null, `"${preview.renamed_from}" already exists here — importing as "${preview.id_would_be}". Nothing of yours is overwritten.`)
+        )
+      ),
+      preview && preview.hash_matches_bundle === false && h('div', { className: 'hf-err' },
+        'The hash recorded by the sender does not match the HTML in this bundle — it was edited or damaged in transit. It still lands in Sandbox; review the code before approving any permission.'
+      ),
+      preview && preview.fits_in_chat_message === false && h('div', { className: 'hf-brand-sub' },
+        `This token is ${preview.token_chars.toLocaleString()} characters — pasted links that long usually arrive truncated. The .hermifact.json file is the reliable way to move it.`
+      ),
       err && h('div', { className: 'hf-err' }, err),
       h('div', { className: 'hf-modal-actions' },
         h('button', { type: 'button', className: 'hf-btn', onClick: onClose }, 'Cancel'),
         h('button', { type: 'button', className: 'hf-btn hf-btn-primary', disabled: busy, onClick: submit },
-          busy ? 'Importing...' : 'Import into Studio'
+          busy ? 'Importing...' : (preview ? `Import ${preview.name}` : 'Import into Studio')
         )
       )
     )

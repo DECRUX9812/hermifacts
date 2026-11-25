@@ -228,15 +228,57 @@ def export_app(app_id: str, request: Request) -> Any:
         share_token = st_mod.encode_share_token(bundle)
         share_path = f"/hermifacts?import={share_token}"
         origin = _request_origin(request)
+        public_origin = ""
+        cfg = _mod("runtime").get_config("public_origin", "")
+        if isinstance(cfg, str) and cfg.strip():
+            public_origin = cfg.strip().rstrip("/")
+        # 8000 chars is the practical ceiling for a messenger; past that the link is
+        # truncated by the client long before it reaches the recipient.
+        limit = getattr(st_mod, "MAX_SHARE_MESSAGE_CHARS", 8000)
+        fits = len(share_token) <= limit
         return {
             "ok": True,
             "bundle": bundle,
             "share_token": share_token,
             "share_path": share_path,
             "share_url": f"{origin}{share_path}",
+            # A link is only usable by someone else when this host is reachable by
+            # name, i.e. when public_origin is configured. Otherwise the token/file is
+            # the portable artifact and the URL is a local convenience.
+            "link_reachable_by_recipient": bool(public_origin),
+            "token_chars": len(share_token),
+            "fits_in_chat_message": fits,
         }
     except KeyError as exc:
         return _fail(str(exc.args[0] if exc.args else exc), 404)
+
+
+@router.post("/apps/inspect")
+def inspect_bundle(body: dict[str, Any]) -> Any:
+    """Preview a share bundle without installing it.
+
+    The recipient sees the sender's name, icon, requested tier, payload size and the
+    exact code hash before anything lands on their machine — and learns up front that
+    a colliding id will be renamed rather than overwrite their own app.
+    """
+    try:
+        st_mod = _mod("store")
+        raw_link = body.get("share_token") or body.get("share_url") or body.get("share_link")
+        if isinstance(raw_link, str) and raw_link.strip():
+            bundle = st_mod.decode_share_token(raw_link)
+        else:
+            bundle = body.get("bundle") if isinstance(body.get("bundle"), dict) else None
+        if not isinstance(bundle, dict):
+            return _fail("Provide 'share_link', 'share_token', or 'bundle'", 400)
+        preview = st_mod.get_store().preview_bundle(bundle)
+        preview["ok"] = True
+        preview["token_chars"] = len(raw_link) if isinstance(raw_link, str) else 0
+        preview["fits_in_chat_message"] = preview["token_chars"] <= getattr(
+            st_mod, "MAX_SHARE_MESSAGE_CHARS", 8000
+        )
+        return preview
+    except ValueError as exc:
+        return _fail(str(exc), 400)
 
 
 @router.post("/apps/import")

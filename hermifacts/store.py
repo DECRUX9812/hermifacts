@@ -29,6 +29,13 @@ ALL_CAPABILITIES = APP_CAPABILITIES | FULL_CAPABILITIES
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 MAX_HTML_BYTES = 2 * 1024 * 1024  # 2 MiB
 MAX_KV_VALUE_BYTES = 512 * 1024   # 512 KiB
+# A pasted share link is untrusted input: refuse absurd payloads BEFORE base64/zlib
+# touch them, so a 40 MB paste cannot burn memory in a dashboard request.
+MAX_SHARE_INPUT_CHARS = 4 * 1024 * 1024
+# Above this the token survives no chat client, email body or QR code. Export still
+# produces it (a file or a paste into a text editor is fine), but callers must say so
+# instead of handing the user a link that gets silently truncated by the messenger.
+MAX_SHARE_MESSAGE_CHARS = 8000
 
 _init_lock = threading.Lock()
 _initialized_dbs: set[str] = set()
@@ -531,22 +538,111 @@ class HermifactsStore:
         if bundle.get("schema") not in (None, "hermifact.bundle.v1"):
             raise ValueError(f"Unsupported bundle schema: {bundle.get('schema')!r}")
         perms = bundle.get("permissions") if isinstance(bundle.get("permissions"), dict) else {}
+        html = str(bundle.get("html") or "")
+        inputs = bundle.get("inputs") if isinstance(bundle.get("inputs"), list) else []
+        # NEVER let a shared bundle overwrite an app that is already here. A bundle id
+        # travels between machines, so two people's "dashboard" collide; landing on the
+        # same id would hit save_app's UPDATE branch and destroy the recipient's app
+        # (its own code, name and approvals) with someone else's. Only an explicit
+        # app_id from the caller — an update the user asked for — may target an
+        # existing id.
+        renamed_from = ""
+        target_id = str(app_id or "").strip()
+        if target_id:
+            try:
+                self.get_app(target_id, include_html=False)
+            except KeyError:
+                renamed_from = ""
+            else:
+                renamed_from = target_id  # explicit overwrite/update, reported not hidden
+        else:
+            base = slugify(str(bundle.get("id") or bundle.get("name") or "imported"))
+            target_id, renamed_from = self._free_app_id(base)
         # Imported apps ALWAYS land unapproved (sandbox) until the recipient explicitly approves!
-        return self.save_app(
-            app_id=app_id or bundle.get("id"),
+        app = self.save_app(
+            app_id=target_id,
             name=str(bundle.get("name") or "Imported Hermifact"),
             description=str(bundle.get("description") or ""),
             icon=str(bundle.get("icon") or "📦"),
             accent=str(bundle.get("accent") or "#6366f1"),
             category=str(bundle.get("category") or "imported"),
-            html=str(bundle.get("html") or ""),
-            inputs=bundle.get("inputs") if isinstance(bundle.get("inputs"), list) else [],
+            html=html,
+            inputs=inputs,
             requested_tier=str(perms.get("requested_tier") or bundle.get("requested_tier") or "sandbox"),
             requested_caps=perms.get("requested_caps") or bundle.get("requested_caps") or [],
             requested_tools=perms.get("requested_tools") or bundle.get("requested_tools") or [],
             starter=False,
             auto_approve_starter=False,
         )
+        if app is None:  # pragma: no cover - save_app always returns the stored row
+            raise ValueError("Import failed: the app was not persisted")
+        # The bundle's own code_hash is only a claim; the store recomputed it from the
+        # bytes it actually holds. Report a disagreement instead of trusting either.
+        declared = str(bundle.get("code_hash") or "").strip()
+        app["hash_matches_bundle"] = bool(declared) and declared == app.get("code_hash")
+        app["hash_declared"] = declared
+        app["import_renamed_from"] = renamed_from
+        app["imported"] = True
+        return app
+
+    def preview_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        """Describe what importing this bundle WOULD do, without writing anything.
+
+        Lets the recipient see the name, the tier they are being asked to grant, the
+        size, and the hash they are approving before a single row changes.
+        """
+        if not isinstance(bundle, dict):
+            raise ValueError("Bundle must be a JSON object")
+        if bundle.get("schema") not in (None, "hermifact.bundle.v1"):
+            raise ValueError(f"Unsupported bundle schema: {bundle.get('schema')!r}")
+        perms = bundle.get("permissions") if isinstance(bundle.get("permissions"), dict) else {}
+        html = str(bundle.get("html") or "")
+        inputs = bundle.get("inputs") if isinstance(bundle.get("inputs"), list) else []
+        if not html.strip():
+            raise ValueError("Bundle has no HTML payload")
+        if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+            raise ValueError(f"App HTML exceeds {MAX_HTML_BYTES // 1024} KB limit")
+        computed = compute_code_hash(html, inputs)
+        declared = str(bundle.get("code_hash") or "").strip()
+        base = slugify(str(bundle.get("id") or bundle.get("name") or "imported"))
+        target_id, renamed_from = self._free_app_id(base)
+        return {
+            "id_would_be": target_id,
+            "renamed_from": renamed_from,
+            "would_overwrite": False,
+            "name": str(bundle.get("name") or "Imported Hermifact"),
+            "description": str(bundle.get("description") or ""),
+            "icon": str(bundle.get("icon") or "📦"),
+            "category": str(bundle.get("category") or "imported"),
+            "requested_tier": str(perms.get("requested_tier") or bundle.get("requested_tier") or "sandbox"),
+            "requested_caps": perms.get("requested_caps") or bundle.get("requested_caps") or [],
+            "requested_tools": perms.get("requested_tools") or bundle.get("requested_tools") or [],
+            "html_bytes": len(html.encode("utf-8")),
+            "code_hash": computed,
+            "code_hash_short": computed[:12],
+            "hash_matches_bundle": bool(declared) and declared == computed,
+            "starts_in_sandbox": True,
+        }
+
+    def _free_app_id(self, base: str) -> tuple[str, str]:
+        """Return (id that is not taken, the base id it had to move off of).
+
+        The suffix is deterministic-ish (``-2``, ``-3`` …) so a second import of the
+        same bundle is easy to spot, and the id always satisfies SLUG_RE.
+        """
+        base = (base or "imported")[:48] or "imported"
+        if not SLUG_RE.match(base):
+            base = slugify(base)
+        with self._tx() as conn:
+            taken = {r["id"] for r in conn.execute("SELECT id FROM apps")}
+        if base not in taken:
+            return base, ""
+        for n in range(2, 1000):
+            cand = f"{base}-{n}"[:64].rstrip("-")
+            if SLUG_RE.match(cand) and cand not in taken:
+                return cand, base
+        stamp = str(int(time.time()))[-6:]
+        return f"{base[:50]}-{stamp}", base
 
     # --- Audit log ------------------------------------------------------------
 
@@ -586,6 +682,12 @@ def decode_share_token(raw_input: str) -> dict[str, Any]:
     s = (raw_input or "").strip()
     if not s:
         raise ValueError("Share token or URL is required")
+    # Untrusted paste: bound it before base64/zlib allocate anything.
+    if len(s) > MAX_SHARE_INPUT_CHARS:
+        raise ValueError(
+            f"Share link is {len(s):,} characters — larger than the "
+            f"{MAX_SHARE_INPUT_CHARS:,} character limit. Use the .hermifact.json bundle instead."
+        )
     token = s
     if "://" in s or "?import=" in s or "#import=" in s:
         parsed = urlparse(s)
