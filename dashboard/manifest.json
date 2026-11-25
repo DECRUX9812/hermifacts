@@ -1,0 +1,9 @@
+{
+  "name": "hermifacts",
+  "label": "Hermifacts",
+  "description": "Turn interactive HTML/JS/CSS artifacts into standalone installable PWA and desktop apps with zero-API-key Hermes LLM access, reactive workflows, shareable links, and hash-pinned permissions.",
+  "icon": "AppWindow",
+  "version": "0.1.0",
+  "api": "plugin_api.py",
+  "tab": { "hidden": true }
+}
