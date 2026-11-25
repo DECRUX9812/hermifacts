@@ -218,8 +218,8 @@ def test_share_token_roundtrip_and_unapproved_import(isolated_env):
     token = encode_share_token(bundle)
     assert token.startswith("hf1.")
     assert decode_share_token(token)["name"] == "Chart Flow"
-    assert decode_share_token(f"https://desktop.decruxtech.com/hermifacts?import={token}")["id"] == "chart-flow"
-    assert decode_share_token(f"https://desktop.decruxtech.com/hermifacts#import={token}")["id"] == "chart-flow"
+    assert decode_share_token(f"https://hermes.example.com/hermifacts?import={token}")["id"] == "chart-flow"
+    assert decode_share_token(f"https://hermes.example.com/hermifacts#import={token}")["id"] == "chart-flow"
 
     imported = st.import_bundle(decode_share_token(token), app_id="chart-flow-copy")
     assert imported["id"] == "chart-flow-copy"

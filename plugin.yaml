@@ -7,7 +7,7 @@ description: >-
   artifacts into standalone PWA and OS desktop apps with zero-API-key LLM
   access, reactive workflow parameters, portable share bundles, and
   hash-pinned 3-tier permissions.
-author: decrux
+author: DECRUX9812
 license: MIT
 requires_hermes: ">=0.22.0"
 provides_tools:
@@ -30,7 +30,7 @@ config_schema:
   public_origin:
     type: string
     default: ""
-    description: Optional public Hermes Webapp origin (e.g. https://desktop.decruxtech.com) used when generating PWA/OS launcher URLs.
+    description: Optional public Hermes Webapp origin (e.g. https://hermes.example.com) used when generating PWA/OS launcher URLs.
   enable_os_notifications:
     type: boolean
     default: true

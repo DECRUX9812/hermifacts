@@ -12,7 +12,13 @@ SYNC_EXCLUDES=(--exclude '.git' --exclude '__pycache__' --exclude '*.pyc' --excl
 
 DEPLOYED_JS=("$ROOT/desktop/plugin.js")
 
-for HERMES_ROOT in "$HOME/.hermes-webapp" "$HOME/.hermes" "/home/streamuser/.hermes"; do
+ROOTS=("$HOME/.hermes-webapp" "$HOME/.hermes")
+if [ -n "${HERMES_EXTRA_ROOTS:-}" ]; then
+  IFS=':' read -r -a EXTRA <<< "$HERMES_EXTRA_ROOTS"
+  ROOTS+=("${EXTRA[@]}")
+fi
+
+for HERMES_ROOT in "${ROOTS[@]}"; do
   if [ -d "$HERMES_ROOT" ] && [ -w "$HERMES_ROOT" ]; then
     mkdir -p "$HERMES_ROOT/plugins/hermifacts" "$HERMES_ROOT/desktop-plugins/hermifacts"
     rsync -a --delete "${SYNC_EXCLUDES[@]}" "$ROOT/" "$HERMES_ROOT/plugins/hermifacts/"
