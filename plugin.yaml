@@ -1,0 +1,37 @@
+name: hermifacts
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >-
+  Installable AI apps (Hermifacts) for Hermes: turn interactive HTML/JS/CSS
+  artifacts into standalone PWA and OS desktop apps with zero-API-key LLM
+  access, reactive workflow parameters, portable share bundles, and
+  hash-pinned 3-tier permissions.
+author: decrux
+license: MIT
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - hermifact_create
+  - hermifact_list
+  - hermifact_get
+  - hermifact_install
+  - hermifact_delete
+  - hermifact_export
+  - hermifact_import
+provides_commands:
+  - hermifacts
+dashboard:
+  api: plugin_api.py
+config_schema:
+  default_tier:
+    type: string
+    default: sandbox
+    description: Default permission tier for newly created Hermifacts (sandbox | app | full).
+  public_origin:
+    type: string
+    default: ""
+    description: Optional public Hermes Webapp origin (e.g. https://desktop.decruxtech.com) used when generating PWA/OS launcher URLs.
+  enable_os_notifications:
+    type: boolean
+    default: true
+    description: Allow Tier-2 (app) Hermifacts to trigger native OS notifications via notify-send / osascript when approved.
