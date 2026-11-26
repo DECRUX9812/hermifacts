@@ -1,9 +1,17 @@
 /* ---------------------------------------------------------------- modals */
 
+const BLOCKED_APP_TOOLS = new Set([
+  'terminal', 'process', 'process_manage', 'close_terminal', 'read_terminal',
+  'execute_code', 'write_file', 'patch', 'delegate_task', 'cronjob',
+  'cronjob_manage', 'send_message', 'computer_use'
+])
+const isBlockedAppTool = (name) => BLOCKED_APP_TOOLS.has(String(name || '').trim().toLowerCase())
+const cleanToolSelection = (items) => new Set((items || []).filter((t) => !isBlockedAppTool(t)))
+
 function PermissionsModal({ app, availableTools, onClose, onSaved }) {
   const [tier, setTier] = useState(app.requested_tier || app.effective_tier || 'sandbox')
   const [caps, setCaps] = useState(() => new Set(app.requested_caps && app.requested_caps.length ? app.requested_caps : (app.effective_caps || [])))
-  const [tools, setTools] = useState(() => new Set(app.requested_tools || app.effective_tools || []))
+  const [tools, setTools] = useState(() => cleanToolSelection(app.requested_tools || app.effective_tools || []))
   const [fsRoot, setFsRoot] = useState(app.requested_fs_root || app.effective_fs_root || '')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -63,9 +71,9 @@ function PermissionsModal({ app, availableTools, onClose, onSaved }) {
 
   const toolList = useMemo(() => {
     const s = new Set(availableTools || [])
-    ;(app.requested_tools || []).forEach((t) => s.add(t))
-    ;(app.effective_tools || []).forEach((t) => s.add(t))
-    return Array.from(s).sort()
+    ;(app.requested_tools || []).forEach((t) => { if (!isBlockedAppTool(t)) s.add(t) })
+    ;(app.effective_tools || []).forEach((t) => { if (!isBlockedAppTool(t)) s.add(t) })
+    return Array.from(s).filter((t) => !isBlockedAppTool(t)).sort()
   }, [availableTools, app])
 
   return h('div', { className: 'hf-backdrop', onClick: (e) => { if (e.target === e.currentTarget) onClose() } },
@@ -106,6 +114,9 @@ function PermissionsModal({ app, availableTools, onClose, onSaved }) {
       ),
       tier !== 'sandbox' && caps.has('tools') && h('div', { className: 'hf-field' },
         h('label', null, 'Allowlisted Hermes Tools'),
+        h('div', { className: 'hf-brand-sub' },
+          'Execution, file-write, process-control, delegation, cron, messaging, and computer-use tools are never app-allowlistable because bridge calls run outside a chat approval turn.'
+        ),
         toolList.length
           ? h('div', { className: 'hf-check-grid', style: { maxHeight: '110px', overflowY: 'auto' } },
               toolList.map((t) =>

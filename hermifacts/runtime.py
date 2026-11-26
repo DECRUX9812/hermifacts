@@ -98,19 +98,30 @@ def model_ready() -> bool:
     return bound is not None and getattr(bound, "llm", None) is not None
 
 
+def session_workspace() -> Path | None:
+    """The calling session's workspace, when Hermes can attribute one to this call."""
+    bound = ctx_or_none()
+    if bound is None or not hasattr(bound, "session_cwd"):
+        return None
+    try:
+        raw = str(bound.session_cwd() or "").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    return resolved if resolved.is_dir() else None
+
+
 def dispatch_tool(tool_name: str, args: dict[str, Any]) -> Any:
     """Dispatch an allowlisted Hermes tool through the bound plugin context."""
-    bound = ctx()
-    if hasattr(bound, "dispatch_tool"):
-        raw = bound.dispatch_tool(tool_name, args)
-        if isinstance(raw, str):
-            try:
-                return json.loads(raw)
-            except Exception:
-                return {"text": raw}
-        return raw
-    from tools.registry import registry
-    raw = registry.dispatch(tool_name, args)
+    raw = ctx().dispatch_tool(tool_name, args)
     if isinstance(raw, str):
         try:
             return json.loads(raw)
@@ -120,14 +131,17 @@ def dispatch_tool(tool_name: str, args: dict[str, Any]) -> Any:
 
 
 def list_available_tools() -> list[str]:
-    """Return currently registered Hermes tool names (for allowlist picker)."""
+    """Return picker-safe registered Hermes tool names at the declared compat floor."""
     try:
         from tools.registry import registry
-        names = []
-        if hasattr(registry, "list_tools"):
-            names = list(registry.list_tools())
-        elif hasattr(registry, "_tools"):
-            names = list(registry._tools.keys())
-        return sorted(n for n in names if isinstance(n, str) and not n.startswith("hermifact_"))
+        from .store import is_blocked_app_tool
+        # Use only public registry enumeration APIs across supported host versions;
+        # never read the private ``registry._tools`` map.
+        names = registry.list_tools() if hasattr(registry, "list_tools") else registry.get_all_tool_names()
+        return sorted(
+            n
+            for n in names
+            if isinstance(n, str) and not n.startswith("hermifact_") and not is_blocked_app_tool(n)
+        )
     except Exception:
         return []

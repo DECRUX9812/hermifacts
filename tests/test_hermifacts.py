@@ -6,7 +6,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -76,8 +76,9 @@ class FakeLLM:
 
 
 class FakePluginCtx:
-    def __init__(self, data_root: Path, *, with_llm: bool = True) -> None:
+    def __init__(self, data_root: Path, workspace: Path | None = None, *, with_llm: bool = True) -> None:
         self._data_root = data_root
+        self._workspace = workspace
         self.llm = FakeLLM() if with_llm else None
         self.config = {
             "default_tier": "sandbox",
@@ -89,6 +90,12 @@ class FakePluginCtx:
 
     def data_dir(self) -> Path:
         return self._data_root
+
+    def session_cwd(self) -> str:
+        return str(self._workspace or "")
+
+    def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
+        return json.dumps({"dispatched": tool_name, "args": args})
 
     def register_tool(self, *, name, toolset, schema, handler, **kwargs):
         self.registered_tools[name] = {
@@ -110,12 +117,14 @@ class FakePluginCtx:
 @pytest.fixture()
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     data_root = tmp_path / "plugin-data"
+    workspace = tmp_path / "workspace"
     data_root.mkdir(parents=True, exist_ok=True)
-    ctx = FakePluginCtx(data_root)
+    workspace.mkdir(parents=True, exist_ok=True)
+    ctx = FakePluginCtx(data_root, workspace)
     runtime.bind(ctx)
     # Ensure both direct imports and private package imports share the same isolated data_dir
     monkeypatch.setattr(runtime, "data_dir", lambda: data_root)
-    yield SimpleNamespace(tmp_path=tmp_path, data_root=data_root, ctx=ctx)
+    yield SimpleNamespace(tmp_path=tmp_path, data_root=data_root, workspace=workspace, ctx=ctx)
     runtime.bind(None)
 
 
@@ -181,6 +190,76 @@ def test_hash_pinned_permissions_invalidate_on_code_edit(isolated_env):
     revoked = st.revoke_permissions("calc-app")
     assert revoked["approved_tier"] == "sandbox"
     assert revoked["approval_stale"] is False
+
+
+def test_execution_write_tools_never_enter_or_survive_app_allowlists(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    dangerous = [
+        "terminal", "process", "process_manage", "close_terminal", "read_terminal",
+        "execute_code", "write_file", "patch", "delegate_task", "cronjob",
+        "cronjob_manage", "send_message", "computer_use",
+    ]
+    app = st.save_app(
+        app_id="tool-gate",
+        name="Tool Gate",
+        html="<p>tools</p>",
+        requested_tier="app",
+        requested_caps=["tools"],
+        requested_tools=["web_search", *dangerous],
+    )
+    assert app["requested_tools"] == ["web_search"]
+
+    approved = st.approve_permissions(
+        "tool-gate",
+        tier="app",
+        caps=["tools"],
+        tools=["web_search", *dangerous],
+        expected_hash=app["code_hash"],
+    )
+    assert approved["approved_tools"] == ["web_search"]
+    assert approved["effective_tools"] == ["web_search"]
+    assert st.require_capability("tool-gate", "tools", tool_name="web_search")["id"] == "tool-gate"
+    for tool_name in dangerous:
+        with pytest.raises(PermissionError, match="cannot be allowlisted"):
+            st.require_capability("tool-gate", "tools", tool_name=tool_name)
+
+    # A database row written by an older/vulnerable version must fail closed too:
+    # even if the dangerous name is present in approved_tools_json, it is neither
+    # effective nor dispatchable through require_capability.
+    with st._tx() as conn:
+        conn.execute(
+            "UPDATE apps SET approved_tools_json = ? WHERE id = ?",
+            (json.dumps(["web_search", "terminal", "write_file"]), "tool-gate"),
+        )
+    legacy = st.get_app("tool-gate", include_html=False)
+    assert legacy["approved_tools"] == ["web_search", "terminal", "write_file"]
+    assert legacy["effective_tools"] == ["web_search"]
+    with pytest.raises(PermissionError, match="cannot be allowlisted"):
+        st.require_capability("tool-gate", "tools", tool_name="terminal")
+    assert st.require_capability("tool-gate", "tools", tool_name="web_search")["id"] == "tool-gate"
+
+
+def test_tool_picker_uses_registry_list_tools_and_filters_dangerous_entries(isolated_env, monkeypatch: pytest.MonkeyPatch):
+    class FakeRegistry:
+        def list_tools(self):
+            return ["terminal", "web_search", "write_file", "read_file", "hermifact_create", "execute_code"]
+
+    tools_pkg = ModuleType("tools")
+    registry_mod = ModuleType("tools.registry")
+    registry_mod.registry = FakeRegistry()
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
+
+    assert runtime.list_available_tools() == ["read_file", "web_search"]
+    assert runtime.dispatch_tool("web_search", {"q": "hermes"}) == {
+        "dispatched": "web_search", "args": {"q": "hermes"}
+    }
+
+    class LegacyOnlyRegistry:
+        _tools = {"web_search": object()}
+
+    registry_mod.registry = LegacyOnlyRegistry()
+    assert runtime.list_available_tools() == []  # no registry._tools fallback at the declared floor
 
 
 def test_kv_isolation_and_cascade_delete(isolated_env):
@@ -285,7 +364,7 @@ def test_imported_bundle_with_elevated_request_lands_in_sandbox(isolated_env):
     }
     app = st.import_bundle(bundle)
     assert app["requested_tier"] == "full"      # the ask is recorded, so it can be reviewed
-    assert app["requested_tools"] == ["terminal"]
+    assert app["requested_tools"] == []  # execution tools are filtered out of the recorded ask
     assert app["effective_tier"] == "sandbox"   # but nothing is granted
     assert app["effective_caps"] == []
     assert app["needs_approval"] is True
@@ -330,6 +409,74 @@ def test_export_flags_tokens_too_long_for_a_message(isolated_env):
     assert out["token_chars"] > store.MAX_SHARE_MESSAGE_CHARS
     assert out["fits_in_chat_message"] is False
     assert ".hermifact.json" in out["share_hint"]
+
+
+# ------------------------------------------------------- Model file/path confinement
+
+def test_create_and_import_file_paths_are_confined_to_workspace_or_plugin_data(isolated_env):
+    workspace_html = isolated_env.workspace / "artifact.html"
+    workspace_html.write_text("<h1>workspace artifact</h1>", encoding="utf-8")
+    created = json.loads(tools.handle_create({
+        "app_id": "from-file",
+        "name": "From File",
+        "file_path": str(workspace_html),
+    }))
+    assert created["ok"] is True
+    got = json.loads(tools.handle_get({"app_id": "from-file", "include_html": True}))
+    assert got["app"]["html"] == "<h1>workspace artifact</h1>"
+
+    outside = isolated_env.tmp_path / "outside.html"
+    outside.write_text("<h1>outside</h1>", encoding="utf-8")
+    denied = json.loads(tools.handle_create({
+        "app_id": "outside-read",
+        "name": "Outside Read",
+        "file_path": str(outside),
+    }))
+    assert denied["ok"] is False
+    assert "session workspace" in denied["error"]
+
+    symlink = isolated_env.workspace / "linked.html"
+    symlink.symlink_to(outside)
+    symlink_denied = json.loads(tools.handle_create({
+        "app_id": "symlink-read",
+        "name": "Symlink Read",
+        "file_path": str(symlink),
+    }))
+    assert symlink_denied["ok"] is False
+
+    src = json.loads(tools.handle_export({"app_id": "from-file"}))
+    bundle_file = isolated_env.workspace / "bundle.hermifact.json"
+    bundle_file.write_text(json.dumps(src["bundle"]), encoding="utf-8")
+    imported = json.loads(tools.handle_import({"file_path": str(bundle_file), "app_id": "imported-file"}))
+    assert imported["ok"] is True
+
+    outside_bundle = isolated_env.tmp_path / "bundle.hermifact.json"
+    outside_bundle.write_text(json.dumps(src["bundle"]), encoding="utf-8")
+    import_denied = json.loads(tools.handle_import({"file_path": str(outside_bundle)}))
+    assert import_denied["ok"] is False
+    assert "session workspace" in import_denied["error"]
+
+
+def test_export_output_path_is_basename_only_inside_exports_folder(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    st.save_app(app_id="export-me", name="Export Me", html="<p>export</p>")
+
+    out = json.loads(tools.handle_export({"app_id": "export-me", "output_path": "backup.hermifact.json"}))
+    assert out["ok"] is True
+    path = Path(out["path"])
+    assert path.parent == (isolated_env.data_root / "exports").resolve()
+    assert path.name == "backup.hermifact.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["id"] == "export-me"
+
+    for bad in (
+        "../escape.hermifact.json",
+        "nested/escape.hermifact.json",
+        str(isolated_env.tmp_path / "escape.hermifact.json"),
+        "wrong-suffix.json",
+    ):
+        denied = json.loads(tools.handle_export({"app_id": "export-me", "output_path": bad}))
+        assert denied["ok"] is False
+    assert not (isolated_env.tmp_path / "escape.hermifact.json").exists()
 
 
 # ------------------------------------------------------------------ PWA & Launcher
@@ -384,8 +531,86 @@ def test_os_launcher_install_and_remove(isolated_env, sys_name: str):
     assert lp.exists()
     assert Path(res["icon_path"]).exists()
     assert res["pwa_url"].endswith(f"/pwa/os-{sys_name}/")
-    assert launcher.remove_os_launcher(str(lp)) is True
+    assert launcher.remove_os_launcher(
+        str(lp), data_root=isolated_env.data_root, home_override=fake_home
+    ) is True
     assert not lp.exists()
+
+
+def test_macos_launcher_uses_app_id_path_and_escapes_plist_name(isolated_env):
+    st = HermifactsStore(root=isolated_env.data_root)
+    app = st.save_app(
+        app_id="safe-mac",
+        name="../Evil & <App>",
+        html="<p>mac</p>",
+    )
+    fake_home = isolated_env.tmp_path / "home-mac-safe"
+    fake_home.mkdir()
+    res = launcher.install_os_launcher(
+        app,
+        origin="https://hermes.example.test",
+        data_root=isolated_env.data_root,
+        system_override="darwin",
+        home_override=fake_home,
+    )
+    bundle = Path(res["launcher_path"])
+    assert bundle.name == "hermifact-safe-mac.app"
+    assert bundle.parent == fake_home / "Applications" / "Hermifacts"
+    assert not (fake_home / "Applications" / "Evil & <App>.app").exists()
+    plist = (bundle / "Contents" / "Info.plist").read_text(encoding="utf-8")
+    assert "../Evil &amp; &lt;App&gt;" in plist
+    assert "../Evil & <App>" not in plist
+
+
+def test_launcher_origin_is_canonical_and_cmd_metacharacters_are_rejected(isolated_env):
+    assert launcher.validate_origin("https://Example.COM:8443/") == "https://example.com:8443"
+    assert launcher.validate_origin("http://127.0.0.1:9120") == "http://127.0.0.1:9120"
+
+    st = HermifactsStore(root=isolated_env.data_root)
+    app = st.save_app(app_id="win-origin", name="Win Origin", html="<p>win</p>")
+    for bad in (
+        'http://127.0.0.1:9120"&calc',
+        "http://127.0.0.1:9120%22",
+        "https://user:pw@example.com",
+        "https://example.com/path",
+        "javascript:example.com",
+    ):
+        with pytest.raises(ValueError):
+            launcher.install_os_launcher(
+                app,
+                origin=bad,
+                data_root=isolated_env.data_root,
+                system_override="windows",
+                home_override=isolated_env.tmp_path,
+            )
+
+
+def test_remove_os_launcher_refuses_paths_outside_owned_launcher_namespaces(isolated_env):
+    victim = isolated_env.tmp_path / "victim.app"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    assert launcher.remove_os_launcher(
+        str(victim), data_root=isolated_env.data_root, home_override=isolated_env.tmp_path
+    ) is False
+    assert victim.exists()
+
+    fake_home = isolated_env.tmp_path / "home-remove"
+    hermifacts_dir = fake_home / "Applications" / "Hermifacts"
+    hermifacts_dir.mkdir(parents=True)
+    link = hermifacts_dir / "link.app"
+    link.symlink_to(victim, target_is_directory=True)
+    assert launcher.remove_os_launcher(
+        str(link), data_root=isolated_env.data_root, home_override=fake_home
+    ) is False
+    assert victim.exists()
+    assert link.exists()
+
+    owned = hermifacts_dir / "legacy-name.app"
+    owned.mkdir()
+    assert launcher.remove_os_launcher(
+        str(owned), data_root=isolated_env.data_root, home_override=fake_home
+    ) is True
+    assert not owned.exists()
 
 
 # ------------------------------------------------------------------ Agent Tools & Registration
@@ -438,6 +663,52 @@ def test_plugin_register_and_tool_handlers(isolated_env):
 
     deleted = json.loads(tools.handle_delete({"app_id": "agent-clone"}))
     assert deleted["ok"] is True
+
+
+# ------------------------------------------------------------------ Notifications
+
+def test_macos_notification_passes_title_body_as_osascript_argv(isolated_env, monkeypatch: pytest.MonkeyPatch):
+    api_mod = _load_api_module()
+    priv_rt = api_mod._mod("runtime")
+    monkeypatch.setattr(priv_rt, "data_dir", lambda: isolated_env.data_root)
+    st_mod = api_mod._mod("store")
+    st = st_mod.get_store()
+    app = st.save_app(
+        app_id="notify-mac",
+        name="Notify Mac",
+        html="<p>notify</p>",
+        requested_tier="app",
+        requested_caps=["notify"],
+    )
+    st.approve_permissions("notify-mac", tier="app", caps=["notify"], expected_hash=app["code_hash"])
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(api_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(api_mod.shutil, "which", lambda binary: "/usr/bin/osascript" if binary == "osascript" else None)
+    monkeypatch.setattr(api_mod.subprocess, "run", fake_run)
+
+    title = 'Title with " quote'
+    msg = 'body trailing slash\\" do shell script "calc"'
+    result = api_mod.bridge_notify("notify-mac", {"title": title, "body": msg})
+    assert result["ok"] is True
+    assert result["delivered_os"] is True
+    assert len(calls) == 1
+    cmd = calls[0]
+    sep = cmd.index("--")
+    assert cmd[:sep] == [
+        "osascript",
+        "-e", "on run argv",
+        "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+        "-e", "end run",
+    ]
+    assert not any("do shell script" in part or "trailing slash" in part for part in cmd[:sep])
+    assert cmd[sep + 1] == msg
+    assert cmd[sep + 2] == title
 
 
 # ------------------------------------------------------------------ FastAPI Integration

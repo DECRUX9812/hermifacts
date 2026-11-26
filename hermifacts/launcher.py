@@ -7,15 +7,24 @@ Hermifact's standalone PWA shell on the user's Hermes gateway.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import platform
+import re
 import shlex
 import shutil
 import stat
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from xml.sax.saxutils import escape as xml_escape
 
+from . import runtime
 from .pwa import render_icon_svg
+
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+LAUNCHER_STEM_RE = re.compile(r"^hermifact-[a-z0-9][a-z0-9-]{0,62}$")
+_ORIGIN_FORBIDDEN_CHARS = frozenset('"&|<>^%')
 
 
 def detect_chromium_binary() -> str | None:
@@ -46,7 +55,66 @@ def detect_chromium_binary() -> str | None:
 
 
 def _safe_desktop_text(s: str) -> str:
-    return " ".join(str(s or "").replace("\n", " ").replace("\r", " ").split())
+    text = "".join(ch for ch in str(s or "") if ord(ch) >= 32 and ord(ch) != 127)
+    return " ".join(text.replace("\n", " ").replace("\r", " ").split())
+
+
+def validate_origin(origin: str) -> str:
+    """Validate and normalize the exact ``http(s)://host[:port]`` origin embedded in launchers.
+
+    Windows ``.cmd`` has no safe general-purpose quoting for shell metacharacters, so
+    the origin is restricted to a canonical host origin rather than escaped text.
+    """
+    text = str(origin or "").strip().rstrip("/")
+    if not text or len(text) > 200:
+        raise ValueError("origin must be an http(s)://host[:port] URL")
+    if any(ord(ch) < 33 or ord(ch) == 127 or ch in _ORIGIN_FORBIDDEN_CHARS for ch in text):
+        raise ValueError("origin contains characters that are unsafe in an OS launcher")
+    try:
+        parts = urlsplit(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid origin URL: {exc}") from exc
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("origin must use http or https and include a host")
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError("origin must not include a path, query, or fragment")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("origin must not include credentials")
+    try:
+        host = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"invalid origin host or port: {exc}") from exc
+    if not host:
+        raise ValueError("origin must include a host")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("origin port must be between 1 and 65535")
+
+    try:
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+            host_out = f"[{host.lower()}]"
+        else:
+            ascii_host = host.encode("idna").decode("ascii").lower()
+            lookup_host = ascii_host[:-1] if ascii_host.endswith(".") else ascii_host
+            labels = lookup_host.split(".") if lookup_host else []
+            if (
+                len(ascii_host) > 253
+                or not labels
+                or any(
+                    not label
+                    or len(label) > 63
+                    or label.startswith("-")
+                    or label.endswith("-")
+                    or not re.fullmatch(r"[a-z0-9-]+", label)
+                    for label in labels
+                )
+            ):
+                raise ValueError("invalid DNS host")
+            host_out = ascii_host
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("origin host must be a valid DNS name or IP address") from exc
+    return f"{parts.scheme}://{host_out}" + (f":{port}" if port is not None else "")
 
 
 def install_os_launcher(
@@ -60,10 +128,13 @@ def install_os_launcher(
     """Write a native OS desktop launcher + icon for *app* and return its metadata."""
     sys_name = (system_override or platform.system()).lower()
     home = Path(home_override) if home_override else Path.home()
-    app_id = app["id"]
+    app_id = str(app.get("id") or "")
+    if not APP_ID_RE.fullmatch(app_id):
+        raise ValueError(f"Invalid Hermifact app id for launcher: {app_id!r}")
     name = _safe_desktop_text(app["name"])
     desc = _safe_desktop_text(app.get("description") or f"{name} — Hermifact AI App")
-    pwa_url = f"{origin.rstrip('/')}{app['pwa_path']}"
+    safe_origin = validate_origin(origin)
+    pwa_url = f"{safe_origin}{app['pwa_path']}"
     browser = detect_chromium_binary()
 
     icons_dir = data_root / "icons"
@@ -114,7 +185,7 @@ def install_os_launcher(
 
     if sys_name == "darwin":
         apps_dir = home / "Applications" / "Hermifacts"
-        bundle = apps_dir / f"{name}.app"
+        bundle = apps_dir / f"hermifact-{app_id}.app"
         macos_dir = bundle / "Contents" / "MacOS"
         res_dir = bundle / "Contents" / "Resources"
         macos_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +204,7 @@ def install_os_launcher(
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
             '<plist version="1.0"><dict>\n'
-            f'  <key>CFBundleName</key><string>{name}</string>\n'
+            f'  <key>CFBundleName</key><string>{xml_escape(name)}</string>\n'
             f'  <key>CFBundleIdentifier</key><string>ai.hermes.hermifact.{app_id}</string>\n'
             '  <key>CFBundleExecutable</key><string>launch</string>\n'
             '  <key>CFBundlePackageType</key><string>APPL</string>\n'
@@ -170,15 +241,62 @@ def install_os_launcher(
     }
 
 
-def remove_os_launcher(launcher_path: str) -> bool:
+def _direct_child_of(path: Path, folder: Path) -> bool:
+    """True when *path* is lexically a direct child of the resolved *folder*."""
+    try:
+        if not path.is_absolute():
+            return False
+        return path.parent.resolve() == folder.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _owned_launcher_path(path: Path, *, data_root: Path, home: Path) -> bool:
+    """Whether *path* belongs to one of the launcher namespaces Hermifacts owns.
+
+    Deletion must fail closed: a stored path is just text in the plugin database and
+    can never be allowed to pick an arbitrary user directory for ``rmtree``.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".app":
+        return _direct_child_of(path, home / "Applications" / "Hermifacts")
+    if suffix == ".cmd":
+        return (
+            LAUNCHER_STEM_RE.fullmatch(path.stem) is not None
+            and _direct_child_of(path, data_root / "launchers")
+        )
+    if suffix == ".desktop":
+        xdg_raw = os.environ.get("XDG_DATA_HOME", "").strip()
+        xdg_data = Path(xdg_raw).expanduser() if xdg_raw else home / ".local" / "share"
+        return (
+            LAUNCHER_STEM_RE.fullmatch(path.stem) is not None
+            and _direct_child_of(path, xdg_data / "applications")
+        )
+    return False
+
+
+def remove_os_launcher(
+    launcher_path: str,
+    *,
+    data_root: Path | None = None,
+    home_override: Path | None = None,
+) -> bool:
     if not launcher_path:
         return False
-    p = Path(launcher_path)
-    if not p.exists():
+    p = Path(launcher_path).expanduser()
+    root = Path(data_root) if data_root is not None else runtime.data_dir()
+    home = Path(home_override) if home_override is not None else Path.home()
+    if not _owned_launcher_path(p, data_root=root, home=home):
+        return False
+    if not os.path.lexists(p):
         return False
     try:
         if p.is_dir() and p.suffix == ".app":
+            if p.is_symlink():
+                return False
             shutil.rmtree(p)
+        elif p.is_dir():
+            return False
         else:
             p.unlink()
         return True

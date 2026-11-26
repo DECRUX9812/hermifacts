@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from . import launcher, runtime
-from .store import decode_share_token, encode_share_token, get_store
+from .store import MAX_HTML_BYTES, decode_share_token, encode_share_token, get_store
 
 
 def _ok(**data: Any) -> str:
@@ -38,6 +38,74 @@ def _public_origin() -> str:
     return ""
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _confined_model_file_path(raw_path: Any) -> Path:
+    """Resolve a model-supplied read path inside the session workspace or plugin data.
+
+    Tool arguments are prompt-injectable. They must never become ambient authority to
+    read arbitrary user files (``.env``, shell rc files, browser state) into an app.
+    """
+    text = str(raw_path or "").strip()
+    if not text:
+        raise ValueError("file_path is required")
+    workspace = runtime.session_workspace()
+    plugin_root = runtime.data_dir().resolve()
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        if workspace is None:
+            raise ValueError("Relative file_path requires an active session workspace")
+        candidate = workspace / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Invalid file_path: {exc}") from exc
+    roots = [plugin_root]
+    if workspace is not None and workspace != plugin_root:
+        roots.insert(0, workspace)
+    if not any(_path_within(resolved, root) for root in roots):
+        raise PermissionError(
+            "file_path must stay inside the session workspace or the Hermifacts plugin data folder"
+        )
+    return resolved
+
+
+def _read_confined_model_file(raw_path: Any, *, max_bytes: int, label: str) -> str:
+    path = _confined_model_file_path(raw_path)
+    if not path.is_file():
+        raise ValueError(f"{label} file not found: {path}")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{label} file exceeds the {max_bytes // 1024} KB limit")
+    return path.read_text(encoding="utf-8")
+
+
+def _export_output_path(store_root: Path, app_id: str, raw_name: Any) -> Path:
+    """Return the confined export target for an optional basename-only output name."""
+    filename = str(raw_name or "").strip() or f"{app_id}.hermifact.json"
+    if (
+        not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or Path(filename).name != filename
+    ):
+        raise ValueError("output_path must be a plain filename, not a path")
+    if not filename.endswith(".hermifact.json"):
+        raise ValueError("output_path must end with .hermifact.json")
+    if len(filename.encode("utf-8")) > 160:
+        raise ValueError("output_path filename is too long")
+    exports_dir = store_root / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    exports_root = exports_dir.resolve()
+    target = (exports_dir / filename).resolve()
+    if target.parent != exports_root:
+        raise ValueError("output_path must stay inside the Hermifacts exports folder")
+    return target
+
+
 def share_link_meta(share_token: str) -> dict[str, Any]:
     """Size facts about a token, so callers stop handing people links that truncate."""
     from .store import MAX_SHARE_MESSAGE_CHARS
@@ -62,10 +130,7 @@ def handle_create(args: dict[str, Any], **_: Any) -> str:
     try:
         html = args.get("html") or ""
         if not html and args.get("file_path"):
-            p = Path(str(args["file_path"])).expanduser()
-            if not p.is_file():
-                return _err(f"HTML file not found: {p}")
-            html = p.read_text(encoding="utf-8")
+            html = _read_confined_model_file(args["file_path"], max_bytes=MAX_HTML_BYTES, label="HTML")
         store = get_store()
         app = store.save_app(
             app_id=args.get("app_id"),
@@ -115,7 +180,9 @@ def handle_get(args: dict[str, Any], **_: Any) -> str:
 def handle_install(args: dict[str, Any], **_: Any) -> str:
     try:
         app_id = str(args.get("app_id") or "").strip()
-        origin = str(args.get("origin") or _default_origin()).strip().rstrip("/")
+        # Tool arguments are model-controlled, so the launcher origin never comes
+        # from the call itself; use operator config or the local dashboard default.
+        origin = _default_origin()
         store = get_store()
         app = store.get_app(app_id, include_html=False)
         result = launcher.install_os_launcher(app, origin=origin, data_root=store.root)
@@ -128,8 +195,11 @@ def handle_install(args: dict[str, Any], **_: Any) -> str:
 def handle_delete(args: dict[str, Any], **_: Any) -> str:
     try:
         app_id = str(args.get("app_id") or "").strip()
-        info = get_store().delete_app(app_id)
-        removed_launcher = launcher.remove_os_launcher(info.get("os_launcher_path", ""))
+        store = get_store()
+        info = store.delete_app(app_id)
+        removed_launcher = launcher.remove_os_launcher(
+            info.get("os_launcher_path", ""), data_root=store.root
+        )
         return _ok(deleted=app_id, removed_launcher=removed_launcher)
     except Exception as exc:
         return _err(str(exc))
@@ -138,7 +208,8 @@ def handle_delete(args: dict[str, Any], **_: Any) -> str:
 def handle_export(args: dict[str, Any], **_: Any) -> str:
     try:
         app_id = str(args.get("app_id") or "").strip()
-        bundle = get_store().export_bundle(app_id)
+        store = get_store()
+        bundle = store.export_bundle(app_id)
         share_token = encode_share_token(bundle)
         meta = share_link_meta(share_token)
         # A link only makes sense if the recipient can open the host that serves it.
@@ -149,8 +220,7 @@ def handle_export(args: dict[str, Any], **_: Any) -> str:
         share_url = f"{origin}{share_path}" if origin else ""
         out_path = str(args.get("output_path") or "").strip()
         if out_path:
-            p = Path(out_path).expanduser()
-            p.parent.mkdir(parents=True, exist_ok=True)
+            p = _export_output_path(store.root, app_id, out_path)
             p.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
             return _ok(
                 path=str(p), app_id=app_id, code_hash=bundle["code_hash"],
@@ -174,8 +244,10 @@ def handle_import(args: dict[str, Any], **_: Any) -> str:
         elif isinstance(bundle, str):
             bundle = decode_share_token(bundle)
         if not bundle and args.get("file_path"):
-            p = Path(str(args["file_path"])).expanduser()
-            bundle = json.loads(p.read_text(encoding="utf-8"))
+            raw = _read_confined_model_file(
+                args["file_path"], max_bytes=MAX_HTML_BYTES + 1024 * 1024, label="bundle"
+            )
+            bundle = json.loads(raw)
         if not isinstance(bundle, dict):
             return _err("Provide 'share_link', 'bundle' (object/JSON string), or 'file_path'")
         app = get_store().import_bundle(bundle, app_id=args.get("app_id"))

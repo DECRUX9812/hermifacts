@@ -100,7 +100,7 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "plugin": "hermifacts",
-        "version": "0.1.0",
+        "version": "0.1.2",
         "model_ready": rt.model_ready(),
         "data_root": str(st.root),
         "platform": platform.system().lower(),
@@ -170,7 +170,7 @@ def delete_app(app_id: str) -> Any:
         st = _mod("store").get_store()
         ln = _mod("launcher")
         info = st.delete_app(app_id)
-        removed_launcher = ln.remove_os_launcher(info.get("os_launcher_path", ""))
+        removed_launcher = ln.remove_os_launcher(info.get("os_launcher_path", ""), data_root=st.root)
         return {"ok": True, "deleted": app_id, "removed_launcher": removed_launcher}
     except KeyError as exc:
         return _fail(str(exc.args[0] if exc.args else exc), 404)
@@ -216,6 +216,8 @@ def install_os(app_id: str, request: Request, body: dict[str, Any] | None = None
         return {"ok": True, "installed": installed, "app": updated}
     except KeyError as exc:
         return _fail(str(exc.args[0] if exc.args else exc), 404)
+    except ValueError as exc:
+        return _fail(str(exc), 400)
     except Exception as exc:
         return _fail(str(exc), 500)
 
@@ -495,10 +497,14 @@ def bridge_notify(app_id: str, body: dict[str, Any]) -> Any:
                 pass
         elif platform.system() == "Darwin" and shutil.which("osascript"):
             try:
-                safe_t = title.replace('"', "'")
-                safe_m = msg.replace('"', "'")
                 subprocess.run(
-                    ["osascript", "-e", f'display notification "{safe_m}" with title "{safe_t}"'],
+                    [
+                        "osascript",
+                        "-e", "on run argv",
+                        "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+                        "-e", "end run",
+                        "--", msg, title,
+                    ],
                     check=False,
                     timeout=2,
                     stdin=subprocess.DEVNULL,

@@ -19,6 +19,10 @@ Turn interactive HTML/JS/CSS artifacts into **standalone installable PWA and nat
   3. **Tier 3 (`full`)**: Everything in App plus read/write confined to one explicitly approved local folder.
   - Every elevated grant is cryptographically pinned to `SHA-256(html + inputs)`. Editing the code automatically locks elevated capabilities until re-approved.
 
+## Dashboard authentication note
+
+Standalone PWAs and OS launchers use the browser's normal dashboard session. On a cookie-authenticated dashboard (`auth_required` / public gateway), the shell and its bridge calls carry the existing login cookie. On Hermes's loopback session-token dashboard, browsers cannot attach the injected `X-Hermes-Session-Token` header to a fresh OS-launched navigation, so the `/api/plugins/hermifacts/pwa/...` shell can answer 401 until Hermes grows a non-API, short-lived launch-handoff surface. That handoff must live in Hermes core; a plugin cannot safely mint or bypass the outer `/api/*` auth gate.
+
 ## Agent Tools & Commands
 
 - `hermifact_create` — Create or update a Hermifact app and return a `::hermifact{id="..."}` inline transcript card.

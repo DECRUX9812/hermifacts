@@ -26,6 +26,26 @@ APP_CAPABILITIES = frozenset({"llm", "notify", "tools", "window"})
 FULL_CAPABILITIES = frozenset({"fs", "exec"})
 ALL_CAPABILITIES = APP_CAPABILITIES | FULL_CAPABILITIES
 
+# Hermifact bridge calls happen outside a chat turn, so tools that can execute,
+# write, delegate, schedule, control the desktop, or message the world are never
+# app-allowlistable. Users can still run those tools through Hermes itself, where
+# the normal turn/approval machinery is present.
+APP_TOOL_DENYLIST = frozenset({
+    "terminal",
+    "process",
+    "process_manage",
+    "close_terminal",
+    "read_terminal",
+    "execute_code",
+    "write_file",
+    "patch",
+    "delegate_task",
+    "cronjob",
+    "cronjob_manage",
+    "send_message",
+    "computer_use",
+})
+
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 MAX_HTML_BYTES = 2 * 1024 * 1024  # 2 MiB
 MAX_KV_VALUE_BYTES = 512 * 1024   # 512 KiB
@@ -82,6 +102,10 @@ def _clean_caps(caps: list[str] | None, tier: str) -> list[str]:
     return sorted(out)
 
 
+def is_blocked_app_tool(tool_name: str) -> bool:
+    return str(tool_name or "").strip().lower() in APP_TOOL_DENYLIST
+
+
 def _clean_str_list(items: list[str] | None, max_items: int = 40) -> list[str]:
     out: list[str] = []
     for x in items or []:
@@ -91,6 +115,10 @@ def _clean_str_list(items: list[str] | None, max_items: int = 40) -> list[str]:
         if len(out) >= max_items:
             break
     return out
+
+
+def _clean_app_tools(items: list[str] | None) -> list[str]:
+    return [name for name in _clean_str_list(items) if not is_blocked_app_tool(name)]
 
 
 class HermifactsStore:
@@ -199,7 +227,7 @@ class HermifactsStore:
         # Effective runtime capabilities are strictly gated by hash match!
         effective_tier = approved_tier if hash_matches else "sandbox"
         effective_caps = approved_caps if hash_matches else []
-        effective_tools = approved_tools if hash_matches else []
+        effective_tools = [t for t in approved_tools if not is_blocked_app_tool(t)] if hash_matches else []
         effective_fs_root = row["approved_fs_root"] if (hash_matches and effective_tier == "full") else ""
 
         out: dict[str, Any] = {
@@ -302,7 +330,7 @@ class HermifactsStore:
 
         tier = _validate_tier(requested_tier)
         caps = _clean_caps(requested_caps, tier)
-        tools = _clean_str_list(requested_tools)
+        tools = _clean_app_tools(requested_tools)
         fs_root = str(requested_fs_root or "").strip()
         if tier == "app" and not caps:
             caps = ["llm"]
@@ -388,7 +416,7 @@ class HermifactsStore:
             if expected_hash and expected_hash != current_hash:
                 raise ValueError("App code changed before approval; review the latest code first")
             clean_caps = _clean_caps(caps if caps is not None else json.loads(row["requested_caps_json"] or "[]"), tier)
-            clean_tools = _clean_str_list(tools if tools is not None else json.loads(row["requested_tools_json"] or "[]"))
+            clean_tools = _clean_app_tools(tools if tools is not None else json.loads(row["requested_tools_json"] or "[]"))
             resolved_fs = ""
             if tier == "full" and (fs_root or row["requested_fs_root"]):
                 resolved_fs = str(Path(fs_root or row["requested_fs_root"]).expanduser().resolve())
@@ -462,6 +490,11 @@ class HermifactsStore:
                 f"App '{app['name']}' does not have approved '{capability}' permission. Approve it in Hermifacts Studio."
             )
         if capability == "tools" and tool_name:
+            if is_blocked_app_tool(tool_name):
+                self.record_audit(app_id, f"tool:{tool_name}", "denied", "tool class cannot be allowlisted to apps")
+                raise PermissionError(
+                    f"Tool '{tool_name}' can execute, write, schedule, delegate, or message outside a chat turn and cannot be allowlisted to a Hermifact."
+                )
             if tool_name not in app["effective_tools"]:
                 self.record_audit(app_id, f"tool:{tool_name}", "denied", "tool not in app allowlist")
                 raise PermissionError(
@@ -616,7 +649,7 @@ class HermifactsStore:
             "category": str(bundle.get("category") or "imported"),
             "requested_tier": str(perms.get("requested_tier") or bundle.get("requested_tier") or "sandbox"),
             "requested_caps": perms.get("requested_caps") or bundle.get("requested_caps") or [],
-            "requested_tools": perms.get("requested_tools") or bundle.get("requested_tools") or [],
+            "requested_tools": _clean_app_tools(perms.get("requested_tools") or bundle.get("requested_tools") or []),
             "html_bytes": len(html.encode("utf-8")),
             "code_hash": computed,
             "code_hash_short": computed[:12],

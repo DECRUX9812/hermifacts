@@ -30,7 +30,7 @@ def register(ctx: Any) -> None:
                     "accent": {"type": "string", "description": "Hex accent color (e.g. #6366f1)"},
                     "category": {"type": "string", "description": "Category (workflow, ai-tool, productivity, utility, dashboard)"},
                     "html": {"type": "string", "description": "Full self-contained HTML/CSS/JS of the app"},
-                    "file_path": {"type": "string", "description": "Alternative to html: path to an existing local HTML file to promote into an app"},
+                    "file_path": {"type": "string", "description": "Alternative to html: path to an existing HTML file inside the session workspace or Hermifacts plugin data folder"},
                     "inputs": {
                         "type": "array",
                         "description": "Optional reactive workflow input controls rendered in the app header (each: {id, label, type: select|range|number|toggle|text, default, options?, min?, max?, step?})",
@@ -38,7 +38,7 @@ def register(ctx: Any) -> None:
                     },
                     "requested_tier": {"type": "string", "enum": ["sandbox", "app", "full"], "description": "Permission tier requested by the app"},
                     "requested_caps": {"type": "array", "items": {"type": "string"}, "description": "Capabilities requested: llm, notify, tools, window, fs"},
-                    "requested_tools": {"type": "array", "items": {"type": "string"}, "description": "Hermes tool names requested if 'tools' capability is needed"},
+                    "requested_tools": {"type": "array", "items": {"type": "string"}, "description": "Hermes tool names requested if 'tools' capability is needed; execution/write/process/delegation/cron/messaging/computer-use tools are never allowlistable"},
                     "requested_fs_root": {"type": "string", "description": "Directory path requested if Tier 3 'fs' capability is needed"},
                 },
                 "required": ["name"],
@@ -86,7 +86,6 @@ def register(ctx: Any) -> None:
                 "type": "object",
                 "properties": {
                     "app_id": {"type": "string"},
-                    "origin": {"type": "string", "description": "Optional Hermes gateway/webapp origin URL (defaults to config public_origin or http://127.0.0.1:9120)"},
                 },
                 "required": ["app_id"],
             },
@@ -119,7 +118,7 @@ def register(ctx: Any) -> None:
                 "type": "object",
                 "properties": {
                     "app_id": {"type": "string"},
-                    "output_path": {"type": "string", "description": "Optional path to save the .hermifact.json file"},
+                    "output_path": {"type": "string", "description": "Optional basename-only filename ending in .hermifact.json; saved inside the Hermifacts exports folder"},
                 },
                 "required": ["app_id"],
             },
@@ -138,7 +137,7 @@ def register(ctx: Any) -> None:
                 "properties": {
                     "share_link": {"type": "string", "description": "Shareable hf1.<token> string or /hermifacts?import=hf1.<token> URL"},
                     "bundle": {"type": "object", "description": "Parsed bundle JSON object"},
-                    "file_path": {"type": "string", "description": "Path to a .hermifact.json file"},
+                    "file_path": {"type": "string", "description": "Path to a .hermifact.json file inside the session workspace or Hermifacts plugin data folder"},
                     "app_id": {"type": "string", "description": "Optional custom slug override"},
                 },
             },
